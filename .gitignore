@@ -1,0 +1,5 @@
+__pycache__/
+test_clips/ride1_detected.mp4
+.DS_Store
+yolov8n.pt
+Ultralytics/

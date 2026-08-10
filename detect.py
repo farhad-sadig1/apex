@@ -1,10 +1,15 @@
-import cv2
+import json
 from pathlib import Path
 
+import cv2
 from ultralytics import YOLO
+
+from incidents.lateral_safety import analyze_lateral_safety
+from incidents.metrics import calculate_ride_metrics
 
 INPUT_PATH = Path("test_clips/ride1.mp4")
 OUTPUT_PATH = Path("test_clips/ride1_detected.mp4")
+TELEMETRY_PATH = Path("test_clips/ride1_telemetry.json")
 # COCO class IDs: person=0, bicycle=1, car=2
 TARGET_CLASSES = [0, 1, 2]
 
@@ -40,6 +45,7 @@ def main() -> None:
         cap.release()
         raise RuntimeError(f"Could not create output video: {OUTPUT_PATH}")
 
+    tracked_objects: list[list[tuple[int, str, tuple[int, int, int, int]]]] = []
     frame_count = 0
     while True:
         ret, frame = cap.read()
@@ -55,6 +61,7 @@ def main() -> None:
         )
         result = results[0]
         visible = extract_visible_tracks(result)
+        tracked_objects.append(visible)
         print(f"Frame {frame_count}: {visible}")
 
         annotated = result.plot()
@@ -64,6 +71,13 @@ def main() -> None:
     cap.release()
     writer.release()
     print(f"Processed {frame_count} frames -> {OUTPUT_PATH}")
+
+    incidents = analyze_lateral_safety(tracked_objects, width)
+    ride_data = calculate_ride_metrics(incidents, frame_count, fps)
+
+    with open(TELEMETRY_PATH, "w", encoding="utf-8") as f:
+        json.dump(ride_data, f, indent=4)
+    print(f"Exported ride telemetry -> {TELEMETRY_PATH}")
 
 
 if __name__ == "__main__":

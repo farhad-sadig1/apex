@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 VEHICLE_CLASSES = frozenset({"car", "truck", "bus"})
 
+# keep in sync with detect.py overlay
+LATERAL_PROXIMITY_THRESHOLD = 0.25
+CRITICAL_PROXIMITY_THRESHOLD = 0.15
+MAX_GAP_PIXEL_FRACTION = 0.15
+
+# skip tiny boxes; gap/height blows up at distance
+MIN_RELEVANT_SIZE_FRACTION = 0.12
+
 
 @dataclass
 class _TrackState:
-    gap_history: deque[float] = field(default_factory=lambda: deque(maxlen=10))
     sustained_violation_frames: int = 0
     dynamic_event: dict[str, Any] | None = None
     sustained_event: dict[str, Any] | None = None
@@ -67,10 +74,25 @@ def _normalized_gap(pixel_gap: float, box: tuple[int, int, int, int]) -> float:
     return pixel_gap / height
 
 
-def _rolling_slope(gap_history: deque[float]) -> float | None:
-    if len(gap_history) < 2:
-        return None
-    return (gap_history[-1] - gap_history[0]) / (len(gap_history) - 1)
+def _box_height_fraction(box: tuple[int, int, int, int], frame_height: int) -> float:
+    """Bbox height as a fraction of frame height."""
+    if frame_height <= 0:
+        return 0.0
+    _, y1, _, y2 = box
+    return max(y2 - y1, 0) / float(frame_height)
+
+
+def _dual_gate(
+    normalized_gap: float,
+    gap_fraction: float,
+    proximity_threshold: float,
+    max_gap_pixel_fraction: float,
+) -> bool:
+    """True when both the box-relative and frame-relative gap gates pass."""
+    return (
+        normalized_gap < proximity_threshold
+        and gap_fraction < max_gap_pixel_fraction
+    )
 
 
 def _log_event(action: str, incident_type: str, track_id: int, frame: int, **details: Any) -> None:
@@ -144,22 +166,17 @@ def _close_active_event(
 def analyze_lateral_safety(
     tracked_objects: Sequence[Sequence[Any]],
     frame_width: int,
+    frame_height: int,
     *,
     side_fraction: float = 0.35,
-    rolling_window: int = 10,
-    closure_slope_threshold: float = 0.05,
-    proximity_threshold: float = 0.4,
+    proximity_threshold: float = LATERAL_PROXIMITY_THRESHOLD,
+    critical_proximity_threshold: float = CRITICAL_PROXIMITY_THRESHOLD,
+    max_gap_pixel_fraction: float = MAX_GAP_PIXEL_FRACTION,
     sustained_frame_threshold: int = 30,
+    min_relevant_size_fraction: float = MIN_RELEVANT_SIZE_FRACTION,
 ) -> list[dict[str, Any]]:
-    """Analyze lateral safety incidents from per-frame tracked objects.
-
-    ``tracked_objects`` is a sequence of frames. Each frame is a sequence of
-    objects shaped like ``{"track_id": int, "class": str, "box": (x1, y1, x2, y2)}``
-    or ``(track_id, class_name, (x1, y1, x2, y2))``.
-    """
-    track_states: dict[int, _TrackState] = defaultdict(
-        lambda: _TrackState(gap_history=deque(maxlen=rolling_window))
-    )
+    """Detect close-pass and sustained side-proximity incidents from tracked vehicles."""
+    track_states: dict[int, _TrackState] = defaultdict(_TrackState)
     incidents: list[dict[str, Any]] = []
 
     for frame_idx, frame_objects in enumerate(tracked_objects):
@@ -171,18 +188,31 @@ def analyze_lateral_safety(
                 continue
             if not _is_in_side_zone(box, frame_width, side_fraction):
                 continue
+            if _box_height_fraction(box, frame_height) <= min_relevant_size_fraction:
+                continue
 
             active_track_ids.add(track_id)
             state = track_states[track_id]
 
             pixel_gap, _ = _inner_edge_and_gap(box, frame_width)
+            gap_fraction = pixel_gap / float(frame_width)
             normalized_gap = _normalized_gap(pixel_gap, box)
-            state.gap_history.append(normalized_gap)
 
-            slope = _rolling_slope(state.gap_history)
-            dynamic_active = slope is not None and slope < -closure_slope_threshold
-            if dynamic_active:
-                dynamic_severity = abs(slope)
+            critical_active = _dual_gate(
+                normalized_gap,
+                gap_fraction,
+                critical_proximity_threshold,
+                max_gap_pixel_fraction,
+            )
+            caution_active = _dual_gate(
+                normalized_gap,
+                gap_fraction,
+                proximity_threshold,
+                max_gap_pixel_fraction,
+            )
+
+            if critical_active:
+                dynamic_severity = critical_proximity_threshold - normalized_gap
                 if state.dynamic_event is None:
                     state.dynamic_event = _start_event(
                         "dynamic_side_closure",
@@ -200,14 +230,16 @@ def analyze_lateral_safety(
                 _close_active_event(state.dynamic_event, incidents)
                 state.dynamic_event = None
 
-            if normalized_gap < proximity_threshold:
+            if caution_active:
                 state.sustained_violation_frames += 1
             else:
                 state.sustained_violation_frames = 0
                 _close_active_event(state.sustained_event, incidents)
                 state.sustained_event = None
 
-            sustained_active = state.sustained_violation_frames > sustained_frame_threshold
+            sustained_active = (
+                state.sustained_violation_frames > sustained_frame_threshold
+            )
             if sustained_active:
                 sustained_severity = (
                     proximity_threshold - normalized_gap
@@ -231,7 +263,6 @@ def analyze_lateral_safety(
                 continue
 
             state.sustained_violation_frames = 0
-            state.gap_history.clear()
             _close_active_event(state.dynamic_event, incidents)
             state.dynamic_event = None
             _close_active_event(state.sustained_event, incidents)

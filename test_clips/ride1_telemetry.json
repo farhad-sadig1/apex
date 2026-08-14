@@ -1,0 +1,186 @@
+{
+    "summary": {
+        "initial_score": 100.0,
+        "final_safety_score": 20.30115615394147,
+        "total_incidents_detected": 22,
+        "ride_duration_seconds": 53.67087526132404
+    },
+    "incidents": [
+        {
+            "track_id": 1256,
+            "incident_type": "dynamic_side_closure",
+            "start_frame": 1415,
+            "end_frame": 1416,
+            "max_severity_score": 0.01785714285714285,
+            "min_normalized_gap": 0.13214285714285715
+        },
+        {
+            "track_id": 150,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 156,
+            "end_frame": 156,
+            "max_severity_score": 2.625,
+            "max_proximity_index": 0.525
+        },
+        {
+            "track_id": 159,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 158,
+            "end_frame": 158,
+            "max_severity_score": 2.398148148148148,
+            "max_proximity_index": 0.47962962962962963
+        },
+        {
+            "track_id": 175,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 173,
+            "end_frame": 176,
+            "max_severity_score": 3.8,
+            "max_proximity_index": 0.47685185185185186
+        },
+        {
+            "track_id": 206,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 183,
+            "end_frame": 185,
+            "max_severity_score": 3.3962962962962964,
+            "max_proximity_index": 0.48703703703703705
+        },
+        {
+            "track_id": 253,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 194,
+            "end_frame": 196,
+            "max_severity_score": 3.3768518518518515,
+            "max_proximity_index": 0.48518518518518516
+        },
+        {
+            "track_id": 237,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 190,
+            "end_frame": 197,
+            "max_severity_score": 5.9222222222222225,
+            "max_proximity_index": 0.4935185185185185
+        },
+        {
+            "track_id": 206,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 200,
+            "end_frame": 203,
+            "max_severity_score": 3.888888888888889,
+            "max_proximity_index": 0.4861111111111111
+        },
+        {
+            "track_id": 253,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 208,
+            "end_frame": 208,
+            "max_severity_score": 2.444444444444444,
+            "max_proximity_index": 0.4888888888888889
+        },
+        {
+            "track_id": 206,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 213,
+            "end_frame": 219,
+            "max_severity_score": 5.510185185185184,
+            "max_proximity_index": 0.5009259259259259
+        },
+        {
+            "track_id": 267,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 203,
+            "end_frame": 221,
+            "max_severity_score": 11.478703703703703,
+            "max_proximity_index": 0.49907407407407406
+        },
+        {
+            "track_id": 275,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 207,
+            "end_frame": 225,
+            "max_severity_score": 11.010185185185184,
+            "max_proximity_index": 0.48518518518518516
+        },
+        {
+            "track_id": 253,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 222,
+            "end_frame": 233,
+            "max_severity_score": 8.207407407407407,
+            "max_proximity_index": 0.512962962962963
+        },
+        {
+            "track_id": 309,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 248,
+            "end_frame": 266,
+            "max_severity_score": 12.011111111111111,
+            "max_proximity_index": 0.5222222222222223
+        },
+        {
+            "track_id": 461,
+            "incident_type": "pedestrian_critical",
+            "start_frame": 387,
+            "end_frame": 424,
+            "max_severity_score": 32.00555555555556,
+            "max_proximity_index": 0.8203703703703704
+        },
+        {
+            "track_id": 685,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 682,
+            "end_frame": 736,
+            "max_severity_score": 26.331481481481482,
+            "max_proximity_index": 0.4842592592592593
+        },
+        {
+            "track_id": 1026,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 992,
+            "end_frame": 992,
+            "max_severity_score": 2.2037037037037037,
+            "max_proximity_index": 0.44074074074074077
+        },
+        {
+            "track_id": 1026,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 999,
+            "end_frame": 1050,
+            "max_severity_score": 30.385185185185186,
+            "max_proximity_index": 0.5425925925925926
+        },
+        {
+            "track_id": 1688,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 1503,
+            "end_frame": 1510,
+            "max_severity_score": 6.033333333333333,
+            "max_proximity_index": 0.5037037037037037
+        },
+        {
+            "track_id": 1691,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 1507,
+            "end_frame": 1513,
+            "max_severity_score": 5.632407407407408,
+            "max_proximity_index": 0.5120370370370371
+        },
+        {
+            "track_id": 1688,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 1530,
+            "end_frame": 1546,
+            "max_severity_score": 11.452777777777778,
+            "max_proximity_index": 0.5453703703703704
+        },
+        {
+            "track_id": 1739,
+            "incident_type": "pedestrian_ahead",
+            "start_frame": 1550,
+            "end_frame": 1550,
+            "max_severity_score": 2.1064814814814814,
+            "max_proximity_index": 0.4212962962962963
+        }
+    ]
+}

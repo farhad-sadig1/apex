@@ -198,6 +198,7 @@ def main() -> None:
 
     all_incidents = lateral_incidents + pedestrian_incidents
     ride_data = calculate_ride_metrics(all_incidents, frame_count, fps)
+    ride_data["summary"]["fps"] = fps
 
     with open(TELEMETRY_PATH, "w", encoding="utf-8") as f:
         json.dump(ride_data, f, indent=4)

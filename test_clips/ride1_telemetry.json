@@ -3,7 +3,8 @@
         "initial_score": 100.0,
         "final_safety_score": 20.30115615394147,
         "total_incidents_detected": 22,
-        "ride_duration_seconds": 53.67087526132404
+        "ride_duration_seconds": 53.67087526132404,
+        "fps": 29.960383395475322
     },
     "incidents": [
         {
@@ -12,7 +13,8 @@
             "start_frame": 1415,
             "end_frame": 1416,
             "max_severity_score": 0.01785714285714285,
-            "min_normalized_gap": 0.13214285714285715
+            "min_normalized_gap": 0.13214285714285715,
+            "side": "left"
         },
         {
             "track_id": 150,

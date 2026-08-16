@@ -14,6 +14,8 @@ def calculate_ride_metrics(
     """Start at 100, deduct per incident, clamp at 0."""
     ride_duration_seconds = total_frames / fps
 
+    safety_score = 100.0
+
     for incident in incidents:
         incident_type = incident.get("incident_type")
         deduction = 0.0
@@ -46,15 +48,14 @@ def calculate_ride_metrics(
 
         safety_score -= deduction
 
-    exposure_factor = total_penalty_weight / max(total_frames, 1.0)
-    final_safety_score = max(0.0, 100.0 - (exposure_factor * 20.0))
+    final_safety_score = max(0.0, safety_score)
 
     return {
         "summary": {
             "initial_score": 100.0,
             "final_safety_score": final_safety_score,
             "total_incidents_detected": len(incidents),
-            "ride_duration_seconds": total_ride_duration_seconds,
+            "ride_duration_seconds": ride_duration_seconds,
         },
         "incidents": incidents,
     }

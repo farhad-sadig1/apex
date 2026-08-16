@@ -150,23 +150,17 @@ const VIEW_H = 700;
 const BIKE_X = 200;
 const BIKE_Y = 502;
 
-/** Vanishing point for the projected path rails. */
+/** Trapezoid road: near and far widths stay close; gradual perspective only. */
 const HORIZON_X = BIKE_X;
-const HORIZON_Y = 58;
-const PATH_NEAR_Y = BIKE_Y - 48;
-/** Half-width at the bike — wide foreground, not a skinny V. */
-const PATH_NEAR_HALF = 118;
-/** Stay wide through the near field, then ease into the horizon. */
-const PATH_MID1_HALF = 102;
-const PATH_MID2_HALF = 34;
+const HORIZON_Y = 64;
+const PATH_NEAR_Y = BIKE_Y - 36;
+const PATH_NEAR_HALF = 100;
+const PATH_FAR_HALF = 82;
+/** Translucent flank panels sit just outside each rail. */
+const ZONE_PAD_NEAR = 42;
+const ZONE_PAD_FAR = 30;
 
 const PERSPECTIVE_LINES = 14;
-
-const FLANK_RINGS: readonly { rx: number; ry: number }[] = [
-  { rx: 48, ry: 60 },
-  { rx: 72, ry: 88 },
-  { rx: 98, ry: 118 },
-];
 
 interface Point {
   x: number;
@@ -479,15 +473,6 @@ function corridorPaint(
 // SVG geometry
 // ---------------------------------------------------------------------------
 
-function flankArc(side: FlankSide, ring: number): string {
-  const radii = FLANK_RINGS[ring];
-  const x = side === 'left' ? BIKE_X - 22 : BIKE_X + 22;
-  const y1 = BIKE_Y - radii.ry * 0.5;
-  const y2 = BIKE_Y + radii.ry * 0.78;
-  const sweep = side === 'left' ? 0 : 1;
-  return `M ${x} ${y1} A ${radii.rx} ${radii.ry} 0 0 ${sweep} ${x} ${y2}`;
-}
-
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
@@ -496,13 +481,23 @@ function lerp(from: number, to: number, t: number): number {
   return from + (to - from) * t;
 }
 
-function pathAnchors(side: FlankSide): [Point, Point, Point, Point] {
+function halfWidthAt(t: number, nearHalf: number, farHalf: number): number {
+  return lerp(nearHalf, farHalf, t);
+}
+
+function pathAnchors(
+  side: FlankSide,
+  nearHalf = PATH_NEAR_HALF,
+  farHalf = PATH_FAR_HALF,
+): [Point, Point, Point, Point] {
   const sign = side === 'left' ? -1 : 1;
+  const y0 = PATH_NEAR_Y;
+  const y3 = HORIZON_Y;
   return [
-    { x: BIKE_X + sign * PATH_NEAR_HALF, y: PATH_NEAR_Y },
-    { x: BIKE_X + sign * PATH_MID1_HALF, y: PATH_NEAR_Y - 155 },
-    { x: HORIZON_X + sign * PATH_MID2_HALF, y: HORIZON_Y + 155 },
-    { x: HORIZON_X, y: HORIZON_Y },
+    { x: BIKE_X + sign * nearHalf, y: y0 },
+    { x: BIKE_X + sign * halfWidthAt(1 / 3, nearHalf, farHalf), y: lerp(y0, y3, 1 / 3) },
+    { x: BIKE_X + sign * halfWidthAt(2 / 3, nearHalf, farHalf), y: lerp(y0, y3, 2 / 3) },
+    { x: BIKE_X + sign * farHalf, y: y3 },
   ];
 }
 
@@ -529,59 +524,34 @@ function projectedLanePath(side: FlankSide): string {
   return `M ${p0.x} ${p0.y} C ${p1.x} ${p1.y}, ${p2.x} ${p2.y}, ${p3.x} ${p3.y}`;
 }
 
+function flankZonePath(side: FlankSide): string {
+  const inner = pathAnchors(side);
+  const outer = pathAnchors(
+    side,
+    PATH_NEAR_HALF + ZONE_PAD_NEAR,
+    PATH_FAR_HALF + ZONE_PAD_FAR,
+  );
+  const [i0, i1, i2, i3] = inner;
+  const [o0, o1, o2, o3] = outer;
+  return [
+    `M ${i0.x} ${i0.y}`,
+    `C ${i1.x} ${i1.y}, ${i2.x} ${i2.y}, ${i3.x} ${i3.y}`,
+    `L ${o3.x} ${o3.y}`,
+    `C ${o2.x} ${o2.y}, ${o1.x} ${o1.y}, ${o0.x} ${o0.y}`,
+    'Z',
+  ].join(' ');
+}
+
 function BicycleGlyph() {
-  const stroke = COLOR.text;
+  const fill = COLOR.text;
   return (
     <G>
-      <Circle cx={0} cy={34} r={16.5} stroke={stroke} strokeWidth={2.4} fill={COLOR.bg} />
-      <Circle cx={0} cy={34} r={3.8} fill={stroke} />
-      <Circle cx={0} cy={-38} r={14.5} stroke={stroke} strokeWidth={2.4} fill={COLOR.bg} />
-      <Circle cx={0} cy={-38} r={3.4} fill={stroke} />
       <Path
-        d="M0 20 L0 -24"
-        stroke={stroke}
-        strokeWidth={3.1}
-        strokeLinecap="round"
-        fill="none"
+        d="M-15 34 C-15 48 15 48 15 34 L12 -26 C12 -40 -12 -40 -12 -26 Z"
+        fill={fill}
       />
-      <Path
-        d="M-27 -28 L27 -28"
-        stroke={stroke}
-        strokeWidth={3.3}
-        strokeLinecap="round"
-        fill="none"
-      />
-      <Path
-        d="M-27 -28 L-29 -41"
-        stroke={stroke}
-        strokeWidth={2.5}
-        strokeLinecap="round"
-        fill="none"
-      />
-      <Path
-        d="M27 -28 L29 -41"
-        stroke={stroke}
-        strokeWidth={2.5}
-        strokeLinecap="round"
-        fill="none"
-      />
-      <Circle cx={-29} cy={-41} r={2.5} fill={COLOR.cyan} />
-      <Circle cx={29} cy={-41} r={2.5} fill={COLOR.cyan} />
-      <Circle cx={0} cy={10} r={5.4} stroke={stroke} strokeWidth={1.8} fill={COLOR.bg} />
-      <Path
-        d="M0 10 L12 18"
-        stroke={stroke}
-        strokeWidth={2}
-        strokeLinecap="round"
-        fill="none"
-      />
-      <Path
-        d="M-7 24 L8 24"
-        stroke={stroke}
-        strokeWidth={3.5}
-        strokeLinecap="round"
-        fill="none"
-      />
+      <Rect x={-23} y={-44} width={46} height={11} rx={5.5} fill={fill} />
+      <Circle cx={0} cy={-4} r={7} fill={COLOR.bg} opacity={0.28} />
     </G>
   );
 }
@@ -632,7 +602,7 @@ function PerspectiveGround() {
   return <G>{lines}</G>;
 }
 
-function SonarFlank({
+function FlankZone({
   side,
   level,
   frame,
@@ -642,35 +612,35 @@ function SonarFlank({
   frame: number;
 }) {
   const live = flankPaint(level, frame);
-  const labelX = side === 'left' ? 36 : 364;
+  const gradientId = `flank-zone-${side}`;
+  const labelX = side === 'left' ? 28 : 372;
   const labelAnchor = side === 'left' ? 'start' : 'end';
   const label = side === 'left' ? 'LEFT' : 'RIGHT';
   const labelColor =
     level === 'close' ? COLOR.red : level === 'caution' ? COLOR.orange : COLOR.muted;
+  const innerX = side === 'left' ? '100%' : '0%';
+  const outerX = side === 'left' ? '0%' : '100%';
 
   return (
     <G>
-      {FLANK_RINGS.map((_, ring) => (
-        <Path
-          key={`${side}-ghost-${ring}`}
-          d={flankArc(side, ring)}
-          stroke={COLOR.greyBand}
-          strokeWidth={8 - ring}
-          strokeLinecap="round"
-          fill="none"
-        />
-      ))}
-      {FLANK_RINGS.map((_, ring) => (
-        <Path
-          key={`${side}-live-${ring}`}
-          d={flankArc(side, ring)}
-          stroke={live.color}
-          strokeWidth={8 - ring}
-          strokeLinecap="round"
-          fill="none"
-          opacity={live.opacity}
-        />
-      ))}
+      <Defs>
+        <LinearGradient
+          id={gradientId}
+          x1={innerX}
+          y1="0%"
+          x2={outerX}
+          y2="0%"
+        >
+          <Stop offset="0" stopColor={live.color} stopOpacity={Math.min(0.55, live.opacity * 0.5)} />
+          <Stop offset="1" stopColor={live.color} stopOpacity={0} />
+        </LinearGradient>
+      </Defs>
+      <Path d={flankZonePath(side)} fill={`url(#${gradientId})`} />
+      <Path
+        d={flankZonePath(side)}
+        fill={live.color}
+        opacity={Math.min(0.22, live.opacity * 0.22)}
+      />
       <SvgText
         x={labelX}
         y={BIKE_Y + 4}
@@ -724,13 +694,6 @@ function PathVector({
           </G>
         );
       })}
-      <Circle
-        cx={HORIZON_X}
-        cy={HORIZON_Y}
-        r={2.4}
-        fill={live.color}
-        opacity={Math.min(1, live.opacity + 0.15)}
-      />
       <SvgText
         x={HORIZON_X}
         y={HORIZON_Y - 14}
@@ -876,18 +839,10 @@ function CockpitCanvas({
     >
       <Atmosphere />
       <PerspectiveGround />
+      <FlankZone side="left" level={left} frame={frame} />
+      <FlankZone side="right" level={right} frame={frame} />
       <PathVector level={corridor} frame={frame} />
       <IncidentActors incidents={incidents} frame={frame} />
-      <SonarFlank side="left" level={left} frame={frame} />
-      <SonarFlank side="right" level={right} frame={frame} />
-      <Circle
-        cx={BIKE_X}
-        cy={BIKE_Y}
-        r={78}
-        stroke={COLOR.hairline}
-        strokeWidth={1}
-        fill="none"
-      />
       <G x={BIKE_X} y={BIKE_Y}>
         <BicycleGlyph />
       </G>

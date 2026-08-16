@@ -106,6 +106,7 @@ def _start_event(
     track_id: int,
     frame_idx: int,
     normalized_gap: float,
+    side: str,
 ) -> dict[str, Any]:
     _log_event(
         "START",
@@ -113,6 +114,7 @@ def _start_event(
         track_id,
         frame_idx,
         normalized_gap=f"{normalized_gap:.3f}",
+        side=side,
     )
     return {
         "track_id": track_id,
@@ -121,6 +123,7 @@ def _start_event(
         "end_frame": frame_idx,
         "max_severity_score": 0.0,
         "min_normalized_gap": normalized_gap,
+        "side": side,
     }
 
 
@@ -144,6 +147,7 @@ def _finalize_event(event: dict[str, Any]) -> dict[str, Any]:
         start_frame=event["start_frame"],
         max_severity=f"{event['max_severity_score']:.3f}",
         min_normalized_gap=f"{event['min_normalized_gap']:.3f}",
+        side=event["side"],
     )
     return {
         "track_id": event["track_id"],
@@ -152,6 +156,7 @@ def _finalize_event(event: dict[str, Any]) -> dict[str, Any]:
         "end_frame": event["end_frame"],
         "max_severity_score": event["max_severity_score"],
         "min_normalized_gap": event["min_normalized_gap"],
+        "side": event["side"],
     }
 
 
@@ -194,7 +199,7 @@ def analyze_lateral_safety(
             active_track_ids.add(track_id)
             state = track_states[track_id]
 
-            pixel_gap, _ = _inner_edge_and_gap(box, frame_width)
+            pixel_gap, side = _inner_edge_and_gap(box, frame_width)
             gap_fraction = pixel_gap / float(frame_width)
             normalized_gap = _normalized_gap(pixel_gap, box)
 
@@ -219,6 +224,7 @@ def analyze_lateral_safety(
                         track_id,
                         frame_idx,
                         normalized_gap,
+                        side,
                     )
                 _update_event(
                     state.dynamic_event,
@@ -250,6 +256,7 @@ def analyze_lateral_safety(
                         track_id,
                         frame_idx,
                         normalized_gap,
+                        side,
                     )
                 _update_event(
                     state.sustained_event,

@@ -24,7 +24,6 @@ MAX_GAP_PIXEL_FRACTION = 0.15
 MIN_RELEVANT_SIZE_FRACTION = 0.12  # ignore distant / tiny vehicle boxes
 PEDESTRIAN_CRITICAL_DEPTH = 0.65  # bottom 35% of the frame
 
-CYAN = (255, 255, 0)
 RED = (0, 0, 255)
 ORANGE = (0, 165, 255)
 GREEN = (0, 255, 0)
@@ -79,10 +78,6 @@ def render_debug_overlay(
     lane_center = width // 2
     left_x = lane_center - lane_half
     right_x = lane_center + lane_half
-
-    cv2.line(annotated_frame, (left_x, horizon_y), (left_x, height), CYAN, 2)
-    cv2.line(annotated_frame, (right_x, horizon_y), (right_x, height), CYAN, 2)
-    cv2.line(annotated_frame, (left_x, horizon_y), (right_x, horizon_y), CYAN, 2)
 
     left_boundary = width * SIDE_FRACTION
     right_boundary = width * (1.0 - SIDE_FRACTION)

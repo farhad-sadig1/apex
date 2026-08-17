@@ -1,18 +1,6 @@
-/**
- * Cyclist ARAS cockpit — dual-screen ride auditor.
- *
- * Left: processed detection video (timing source), served from
- * `public/ride1_detected.mp4` as `/ride1_detected.mp4`.
- * Right: Tesla-style sonar HUD driven by the video clock.
- *
- * Frame index is derived from native playback position:
- *   currentFrame = floor(videoCurrentTimeSeconds * summary.fps)
- * Web uses HTML5 <video> timeupdate (+ rAF while playing).
- * Native uses expo-video timeUpdate (SDK 57 successor to
- * expo-av onPlaybackStatusUpdate). The video is never seeked
- * from a radar interval.
- */
+/** Detection video on the left, HUD on the right, both driven by video time. */
 import { useEventListener } from 'expo';
+import { Asset } from 'expo-asset';
 import { StatusBar } from 'expo-status-bar';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import {
@@ -25,8 +13,10 @@ import {
   useState,
 } from 'react';
 import {
+  Image,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -35,21 +25,29 @@ import {
 import Svg, {
   Circle,
   Defs,
+  Ellipse,
+  FeComposite,
+  FeFlood,
+  FeGaussianBlur,
+  FeMerge,
+  FeMergeNode,
+  Filter,
   G,
   LinearGradient,
   Path,
+  RadialGradient,
   Rect,
   Stop,
   Text as SvgText,
 } from 'react-native-svg';
 
 import telemetryJson from './assets/telemetry/ride1_telemetry.json';
+import { resolveAssetUri } from './assetUri';
 
-// ---------------------------------------------------------------------------
-// Domain types — mirrors the backend ride telemetry payload
-// ---------------------------------------------------------------------------
+const CYCLIST_ICON = require('./src/assets/cyclist-icon.png');
 
-/** Lateral / pedestrian incident classes emitted by the Python pipeline. */
+// --- types ---
+
 type IncidentType =
   | 'dynamic_side_closure'
   | 'sustained_side_proximity'
@@ -57,6 +55,7 @@ type IncidentType =
   | 'pedestrian_critical';
 
 type FlankSide = 'left' | 'right';
+type CorridorLane = 'left' | 'center' | 'right';
 
 interface TelemetryIncident {
   track_id: number;
@@ -66,13 +65,30 @@ interface TelemetryIncident {
   max_severity_score: number;
   min_normalized_gap?: number;
   max_proximity_index?: number;
-  /** Optional until the exporter stamps overtake side onto lateral events. */
+  /** 0 left rail → 1 right rail, at peak proximity */
+  lateral_position?: number;
+  /** vehicle overtake side; often missing */
   side?: FlankSide | string;
 }
 
+type FrameStatus = 'clear' | 'awareness' | 'risk' | 'critical';
+type IncidentTier = 'awareness' | 'risk' | 'critical';
+
+interface RiskCriticalEvent {
+  tier: IncidentTier | string;
+  incident_type: IncidentType | string;
+  start_frame: number;
+  timestamp_seconds: number;
+}
+
 interface RideSummary {
-  initial_score: number;
-  final_safety_score: number;
+  tier_counts: {
+    awareness: number;
+    risk: number;
+    critical: number;
+  };
+  risk_critical_events: RiskCriticalEvent[];
+  risk_critical_per_minute: number;
   total_incidents_detected: number;
   ride_duration_seconds: number;
   fps?: number;
@@ -81,9 +97,9 @@ interface RideSummary {
 interface TelemetryLog {
   summary: RideSummary;
   incidents: TelemetryIncident[];
+  frame_status: FrameStatus[];
 }
 
-/** Per-tick boolean raster that lights the four cockpit sectors. */
 interface SectorThreats {
   leftCaution: boolean;
   leftClose: boolean;
@@ -95,12 +111,6 @@ interface SectorThreats {
 
 type FlankLevel = 'safe' | 'caution' | 'close';
 type CorridorLevel = 'safe' | 'ahead' | 'critical';
-type AlertTone = 'safe' | 'caution' | 'critical';
-
-interface PrimaryAlert {
-  title: string;
-  tone: AlertTone;
-}
 
 interface CanvasSize {
   width: number;
@@ -111,38 +121,49 @@ interface PlaybackController {
   play: () => void;
   pause: () => void;
   reset: () => void;
+  seek: (seconds: number) => void;
 }
 
-// ---------------------------------------------------------------------------
-// Design tokens — Tesla-style dark cockpit
-// ---------------------------------------------------------------------------
+// --- colors ---
 
 const COLOR = {
   bg: '#000000',
+  radar: '#0c0f12',
+  radarAlt: '#111215',
+  road: '#14181e',
+  horizonMist: '#2C303B',
   text: '#F4F6F8',
   muted: '#8B9198',
   hairline: '#1C1F24',
   cyan: '#6EE7F9',
+  rail: '#3ac1e0',
+  railGlow: '#52b2cf',
   cyanDeep: '#143A42',
   greyBand: '#2A3036',
   orange: '#FF8A3D',
+  orangeRed: '#FF5A33',
   red: '#FF2A2A',
   island: '#0B0D10',
   vehicle: '#3A4046',
   atmosphere: '#1A2228',
 } as const;
 
-/** Statically served from `cyclist-aras/public/` — not a Metro `require()`. */
+/** from public/, not a metro require */
 const RIDE_VIDEO_URI = '/ride1_detected.mp4';
 
-/**
- * Minimum on-glass persistence for a threat. A 1–2 frame backend event is
- * otherwise invisible (~33–66 ms). 12 frames ≈ 400 ms, the lower bound for
- * a glanceable HUD cue.
- */
+/** pad short backend hits so they actually show on the HUD */
 const MIN_HUD_FRAMES = 12;
 
-/** Keep in lockstep with incidents/lateral_safety.py. */
+const ALERT_FADE_MS = 250;
+
+const WEB_TINT_STYLE =
+  Platform.OS === 'web'
+    ? {
+        transition: `opacity ${ALERT_FADE_MS}ms ease, fill ${ALERT_FADE_MS}ms ease, stroke ${ALERT_FADE_MS}ms ease`,
+      }
+    : undefined;
+
+/** keep in sync with incidents/lateral_safety.py */
 const LATERAL_PROXIMITY_THRESHOLD = 0.25;
 
 const VIEW_W = 400;
@@ -150,30 +171,34 @@ const VIEW_H = 700;
 const BIKE_X = 200;
 const BIKE_Y = 502;
 
-/** Trapezoid road: near and far widths stay close; gradual perspective only. */
 const HORIZON_X = BIKE_X;
 const HORIZON_Y = 64;
 const PATH_NEAR_Y = BIKE_Y - 36;
-const PATH_NEAR_HALF = 100;
-const PATH_FAR_HALF = 82;
-/** Translucent flank panels sit just outside each rail. */
-const ZONE_PAD_NEAR = 42;
-const ZONE_PAD_FAR = 30;
+const PATH_NEAR_HALF = 124;
+const ZONE_PAD_NEAR = 46;
+const ICON_VIEW = 168;
+const GLOW_VIEW = 252;
 
-const PERSPECTIVE_LINES = 14;
+const Z_NEAR = 1.8;
+const Z_FAR = 36;
+const PERSPECTIVE_LINES = 18;
+const RUNG_OPACITY_NEAR = 1;
+const RUNG_OPACITY_FAR = 0.15;
 
 interface Point {
   x: number;
   y: number;
 }
 
-// ---------------------------------------------------------------------------
-// Telemetry bootstrap (module scope — parse once)
-// ---------------------------------------------------------------------------
+// --- telemetry ---
 
 function loadTelemetry(raw: unknown): TelemetryLog {
   const data = raw as TelemetryLog;
-  if (!data?.summary || !Array.isArray(data.incidents)) {
+  if (
+    !data?.summary ||
+    !Array.isArray(data.incidents) ||
+    !Array.isArray(data.frame_status)
+  ) {
     throw new Error('Invalid ARAS telemetry payload.');
   }
   return data;
@@ -191,53 +216,22 @@ const MAX_INCIDENT_FRAME = INCIDENTS.reduce(
   0,
 );
 
-/** Inclusive playback length: frames [0, FRAME_COUNT - 1]. */
 const FRAME_COUNT = Math.max(
   1,
+  TELEMETRY.frame_status.length,
   Math.round(SUMMARY.ride_duration_seconds * PLAYBACK_FPS),
   MAX_INCIDENT_FRAME + 1,
 );
 
 const LAST_FRAME = FRAME_COUNT - 1;
 
-function incidentDeduction(incident: TelemetryIncident, fps: number): number {
-  switch (incident.incident_type) {
-    case 'dynamic_side_closure': {
-      const intensity = Math.tanh(incident.max_severity_score * 10);
-      return 15 * intensity;
-    }
-    case 'sustained_side_proximity': {
-      const gap = incident.min_normalized_gap ?? LATERAL_PROXIMITY_THRESHOLD;
-      const proximityMultiplier =
-        gap < LATERAL_PROXIMITY_THRESHOLD
-          ? (LATERAL_PROXIMITY_THRESHOLD - gap) / LATERAL_PROXIMITY_THRESHOLD
-          : 0;
-      return 10 * (1 + proximityMultiplier);
-    }
-    case 'pedestrian_ahead':
-    case 'pedestrian_critical': {
-      const durationSeconds =
-        (incident.end_frame - incident.start_frame + 1) / fps;
-      const maxProximity = incident.max_proximity_index ?? 0.5;
-      const durationFactor = Math.tanh(durationSeconds / 3);
-      const base = incident.incident_type === 'pedestrian_ahead' ? 8 : 15;
-      return base * (0.5 + 0.5 * durationFactor) * (0.5 + 0.5 * maxProximity);
-    }
-    default:
-      return 0;
-  }
-}
+const STATUS_COPY: Record<FrameStatus, { label: string; color: string }> = {
+  clear: { label: 'CORRIDOR CLEAR', color: COLOR.cyan },
+  awareness: { label: 'AWARENESS', color: COLOR.orange },
+  risk: { label: 'RISK', color: COLOR.orangeRed },
+  critical: { label: 'CRITICAL', color: COLOR.red },
+};
 
-const RAW_DEDUCTIONS = INCIDENTS.map((incident) =>
-  incidentDeduction(incident, PLAYBACK_FPS),
-);
-const RAW_TOTAL = RAW_DEDUCTIONS.reduce((sum, value) => sum + value, 0);
-const TARGET_DROP = SUMMARY.initial_score - SUMMARY.final_safety_score;
-const SCALED_DEDUCTIONS = RAW_DEDUCTIONS.map((value) =>
-  RAW_TOTAL > 0 ? (value / RAW_TOTAL) * TARGET_DROP : 0,
-);
-
-/** `currentFrame = floor(video.currentTime * summary.fps)`. */
 function frameFromVideoTime(seconds: number): number {
   if (!Number.isFinite(seconds) || seconds <= 0) {
     return 0;
@@ -245,9 +239,7 @@ function frameFromVideoTime(seconds: number): number {
   return Math.min(LAST_FRAME, Math.floor(seconds * PLAYBACK_FPS));
 }
 
-// ---------------------------------------------------------------------------
-// Threat extraction + live score
-// ---------------------------------------------------------------------------
+// --- threats ---
 
 function isVisuallyActive(incident: TelemetryIncident, frame: number): boolean {
   const visualEnd = Math.max(
@@ -257,10 +249,7 @@ function isVisuallyActive(incident: TelemetryIncident, frame: number): boolean {
   return frame >= incident.start_frame && frame <= visualEnd;
 }
 
-/**
- * Side-vehicle events may omit `side`. Fail visible: light both flanks rather
- * than hide a close-pass. Explicit `left` / `right` win when present.
- */
+/** missing side → light both flanks */
 function resolveFlank(incident: TelemetryIncident): FlankSide | 'both' {
   if (incident.side === 'left' || incident.side === 'right') {
     return incident.side;
@@ -333,26 +322,6 @@ function extractActiveIncidents(
   return incidents.filter((incident) => isVisuallyActive(incident, frame));
 }
 
-function exposureWeight(frame: number, incident: TelemetryIncident): number {
-  if (frame < incident.start_frame) {
-    return 0;
-  }
-  const span = Math.max(
-    incident.end_frame - incident.start_frame + 1,
-    MIN_HUD_FRAMES,
-  );
-  return Math.min(1, (frame - incident.start_frame + 1) / span);
-}
-
-/** Live score: 100 at frame 0, eases toward final_safety_score as hazards fire. */
-function safetyScoreAt(frame: number): number {
-  let drop = 0;
-  for (let index = 0; index < INCIDENTS.length; index += 1) {
-    drop += SCALED_DEDUCTIONS[index] * exposureWeight(frame, INCIDENTS[index]);
-  }
-  return Math.max(0, SUMMARY.initial_score - drop);
-}
-
 function flankLevel(caution: boolean, close: boolean): FlankLevel {
   if (close) return 'close';
   if (caution) return 'caution';
@@ -365,64 +334,61 @@ function corridorLevel(threats: SectorThreats): CorridorLevel {
   return 'safe';
 }
 
-function primaryAlert(threats: SectorThreats): PrimaryAlert {
-  if (threats.pedestrianCritical) {
-    return { title: 'PEDESTRIAN COLLISION WARNING', tone: 'critical' };
-  }
-  if (threats.leftClose || threats.rightClose) {
-    const side =
-      threats.leftClose && threats.rightClose
-        ? 'BOTH'
-        : threats.leftClose
-          ? 'LEFT'
-          : 'RIGHT';
-    return { title: `SIDE VEHICLE CLOSE · ${side}`, tone: 'critical' };
-  }
-  if (threats.pedestrianAhead) {
-    return { title: 'PEDESTRIAN AHEAD', tone: 'caution' };
-  }
-  if (threats.leftCaution || threats.rightCaution) {
-    const side =
-      threats.leftCaution && threats.rightCaution
-        ? 'BOTH'
-        : threats.leftCaution
-          ? 'LEFT'
-          : 'RIGHT';
-    return { title: `SIDE VEHICLE CAUTION · ${side}`, tone: 'caution' };
-  }
-  return { title: 'CORRIDOR CLEAR', tone: 'safe' };
-}
-
-function hexChannel(hex: string, shift: number): number {
-  return (parseInt(hex.slice(1), 16) >> shift) & 0xff;
-}
-
-function mixHex(from: string, to: string, t: number): string {
-  const clamped = Math.max(0, Math.min(1, t));
-  const mix = (shift: number) =>
-    Math.round(
-      hexChannel(from, shift) +
-        (hexChannel(to, shift) - hexChannel(from, shift)) * clamped,
-    );
-  const r = mix(16);
-  const g = mix(8);
-  const b = mix(0);
-  return `#${[r, g, b].map((value) => value.toString(16).padStart(2, '0')).join('')}`;
-}
-
-/** Compact meter hue: cyan (healthy) → orange → red (depleted). */
-function scoreHue(score: number): string {
-  if (score >= 70) {
-    return mixHex(COLOR.orange, COLOR.cyan, (score - 70) / 30);
-  }
-  return mixHex(COLOR.red, COLOR.orange, score / 70);
+function formatSeconds(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainder = totalSeconds % 60;
+  return `${minutes}:${remainder.toString().padStart(2, '0')}`;
 }
 
 function formatClock(frame: number): string {
-  const totalSeconds = Math.floor(frame / PLAYBACK_FPS);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  return formatSeconds(frame / PLAYBACK_FPS);
+}
+
+function formatIncidentType(type: string): string {
+  return type.replace(/_/g, ' ').toUpperCase();
+}
+
+function formatIncidentTypeSubtitle(type: string): string {
+  return type.replace(/_/g, ' ').toLowerCase();
+}
+
+const INCIDENT_STATUS_BY_TYPE: Record<string, FrameStatus> = {
+  pedestrian_ahead: 'awareness',
+  sustained_side_proximity: 'risk',
+  pedestrian_critical: 'critical',
+  dynamic_side_closure: 'critical',
+};
+
+function incidentStatus(incident: TelemetryIncident): FrameStatus {
+  return INCIDENT_STATUS_BY_TYPE[incident.incident_type] ?? 'awareness';
+}
+
+function activeIncidentTypeLabel(
+  incidents: readonly TelemetryIncident[],
+  frame: number,
+  status: FrameStatus,
+): string {
+  if (status === 'clear') {
+    return '';
+  }
+
+  const active = incidents.filter(
+    (incident) =>
+      frame >= incident.start_frame && frame <= incident.end_frame,
+  );
+  if (active.length === 0) {
+    return '';
+  }
+
+  const ranked = active.filter(
+    (incident) => incidentStatus(incident) === status,
+  );
+  const pool = ranked.length > 0 ? ranked : active;
+  const chosen = pool.reduce((best, incident) =>
+    incident.max_severity_score > best.max_severity_score ? incident : best,
+  );
+  return formatIncidentTypeSubtitle(String(chosen.incident_type));
 }
 
 function padFrame(frame: number): string {
@@ -450,28 +416,73 @@ function flankPaint(
   if (level === 'caution') {
     return { color: COLOR.orange, opacity: 0.92 };
   }
-  return { color: COLOR.cyan, opacity: pulse(frame) };
+  return { color: COLOR.rail, opacity: pulse(frame) };
 }
 
-function corridorPaint(
-  level: CorridorLevel,
-  frame: number,
-): { color: string; opacity: number } {
-  if (level === 'critical') {
-    return {
-      color: COLOR.red,
-      opacity: flashOn(frame, 2) ? 0.95 : 0.18,
+function alertTint(status: FrameStatus): string {
+  if (status === 'critical') {
+    return COLOR.red;
+  }
+  if (status === 'risk') {
+    return COLOR.orange;
+  }
+  return COLOR.rail;
+}
+
+function hexToRgb(hex: string): [number, number, number] {
+  const raw = hex.replace('#', '');
+  return [
+    parseInt(raw.slice(0, 2), 16),
+    parseInt(raw.slice(2, 4), 16),
+    parseInt(raw.slice(4, 6), 16),
+  ];
+}
+
+function lerpHex(from: string, to: string, t: number): string {
+  const a = hexToRgb(from);
+  const b = hexToRgb(to);
+  const mix = (index: number) => Math.round(lerp(a[index], b[index], t));
+  return `rgb(${mix(0)}, ${mix(1)}, ${mix(2)})`;
+}
+
+function easeCss(t: number): number {
+  // smoothstep ≈ css ease
+  return t * t * (3 - 2 * t);
+}
+
+/** 250ms fade. fromZero = start at 0 on mount. */
+function useAlertFade(active: boolean, fromZero = false): number {
+  const [progress, setProgress] = useState(() =>
+    fromZero ? 0 : active ? 1 : 0,
+  );
+  const progressRef = useRef(progress);
+  progressRef.current = progress;
+
+  useEffect(() => {
+    const from = progressRef.current;
+    const to = active ? 1 : 0;
+    if (from === to) {
+      return undefined;
+    }
+    const started = Date.now();
+    let raf = 0;
+    const tick = () => {
+      const linear = clamp01((Date.now() - started) / ALERT_FADE_MS);
+      const next = from + (to - from) * easeCss(linear);
+      progressRef.current = next;
+      setProgress(next);
+      if (linear < 1) {
+        raf = requestAnimationFrame(tick);
+      }
     };
-  }
-  if (level === 'ahead') {
-    return { color: COLOR.orange, opacity: 0.88 };
-  }
-  return { color: COLOR.cyan, opacity: 0.62 + pulse(frame) * 0.28 };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [active]);
+
+  return progress;
 }
 
-// ---------------------------------------------------------------------------
-// SVG geometry
-// ---------------------------------------------------------------------------
+// --- geometry ---
 
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
@@ -481,98 +492,163 @@ function lerp(from: number, to: number, t: number): number {
   return from + (to - from) * t;
 }
 
-function halfWidthAt(t: number, nearHalf: number, farHalf: number): number {
-  return lerp(nearHalf, farHalf, t);
+function worldXForLane(lane: CorridorLane, extra = 0): number {
+  if (lane === 'left') {
+    return -(PATH_NEAR_HALF + extra);
+  }
+  if (lane === 'right') {
+    return PATH_NEAR_HALF + extra;
+  }
+  return 0;
 }
 
-function pathAnchors(
-  side: FlankSide,
-  nearHalf = PATH_NEAR_HALF,
-  farHalf = PATH_FAR_HALF,
-): [Point, Point, Point, Point] {
-  const sign = side === 'left' ? -1 : 1;
-  const y0 = PATH_NEAR_Y;
-  const y3 = HORIZON_Y;
-  return [
-    { x: BIKE_X + sign * nearHalf, y: y0 },
-    { x: BIKE_X + sign * halfWidthAt(1 / 3, nearHalf, farHalf), y: lerp(y0, y3, 1 / 3) },
-    { x: BIKE_X + sign * halfWidthAt(2 / 3, nearHalf, farHalf), y: lerp(y0, y3, 2 / 3) },
-    { x: BIKE_X + sign * farHalf, y: y3 },
-  ];
+function depthScale(z: number): number {
+  return Z_NEAR / z;
 }
 
-function cubicPoint(points: [Point, Point, Point, Point], t: number): Point {
-  const u = 1 - t;
-  const tt = t * t;
-  const uu = u * u;
+function projectWorld(worldX: number, z: number): Point {
+  const scale = depthScale(z);
   return {
-    x:
-      uu * u * points[0].x +
-      3 * uu * t * points[1].x +
-      3 * u * tt * points[2].x +
-      tt * t * points[3].x,
-    y:
-      uu * u * points[0].y +
-      3 * uu * t * points[1].y +
-      3 * u * tt * points[2].y +
-      tt * t * points[3].y,
+    x: HORIZON_X + worldX * scale,
+    y: HORIZON_Y + (PATH_NEAR_Y - HORIZON_Y) * scale,
   };
 }
 
-function projectedLanePath(side: FlankSide): string {
-  const [p0, p1, p2, p3] = pathAnchors(side);
-  return `M ${p0.x} ${p0.y} C ${p1.x} ${p1.y}, ${p2.x} ${p2.y}, ${p3.x} ${p3.y}`;
+function zAtDepthT(t: number): number {
+  const scale = lerp(1, Z_NEAR / Z_FAR, clamp01(t));
+  return Z_NEAR / scale;
 }
 
-function flankZonePath(side: FlankSide): string {
-  const inner = pathAnchors(side);
-  const outer = pathAnchors(
-    side,
-    PATH_NEAR_HALF + ZONE_PAD_NEAR,
-    PATH_FAR_HALF + ZONE_PAD_FAR,
-  );
-  const [i0, i1, i2, i3] = inner;
-  const [o0, o1, o2, o3] = outer;
+function projectLane(lane: CorridorLane, t: number, extra = 0): Point {
+  return projectWorld(worldXForLane(lane, extra), zAtDepthT(t));
+}
+
+function projectedLanePath(side: FlankSide): string {
+  const near = projectLane(side, 0);
+  const far = projectLane(side, 1);
+  return `M ${near.x} ${near.y} L ${far.x} ${far.y}`;
+}
+
+function roadSurfacePath(): string {
+  const leftNear = projectLane('left', 0);
+  const leftFar = projectLane('left', 1);
+  const rightFar = projectLane('right', 1);
+  const rightNear = projectLane('right', 0);
   return [
-    `M ${i0.x} ${i0.y}`,
-    `C ${i1.x} ${i1.y}, ${i2.x} ${i2.y}, ${i3.x} ${i3.y}`,
-    `L ${o3.x} ${o3.y}`,
-    `C ${o2.x} ${o2.y}, ${o1.x} ${o1.y}, ${o0.x} ${o0.y}`,
+    `M ${leftNear.x} ${leftNear.y}`,
+    `L ${leftFar.x} ${leftFar.y}`,
+    `L ${rightFar.x} ${rightFar.y}`,
+    `L ${rightNear.x} ${rightNear.y}`,
     'Z',
   ].join(' ');
 }
 
-function BicycleGlyph() {
-  const fill = COLOR.text;
+function laneSheetPath(side: FlankSide): string {
+  const innerNear = projectLane('center', 0);
+  const innerFar = projectLane('center', 1);
+  const outerNear = projectLane(side, 0);
+  const outerFar = projectLane(side, 1);
+  return [
+    `M ${innerNear.x} ${innerNear.y}`,
+    `L ${innerFar.x} ${innerFar.y}`,
+    `L ${outerFar.x} ${outerFar.y}`,
+    `L ${outerNear.x} ${outerNear.y}`,
+    'Z',
+  ].join(' ');
+}
+
+function flankZonePath(side: FlankSide): string {
+  const innerNear = projectLane(side, 0);
+  const innerFar = projectLane(side, 1);
+  const outerNear = projectLane(side, 0, ZONE_PAD_NEAR);
+  const outerFar = projectLane(side, 1, ZONE_PAD_NEAR);
+  return [
+    `M ${innerNear.x} ${innerNear.y}`,
+    `L ${innerFar.x} ${innerFar.y}`,
+    `L ${outerFar.x} ${outerFar.y}`,
+    `L ${outerNear.x} ${outerNear.y}`,
+    'Z',
+  ].join(' ');
+}
+
+function RadarDefs() {
   return (
-    <G>
-      <Path
-        d="M-15 34 C-15 48 15 48 15 34 L12 -26 C12 -40 -12 -40 -12 -26 Z"
-        fill={fill}
-      />
-      <Rect x={-23} y={-44} width={46} height={11} rx={5.5} fill={fill} />
-      <Circle cx={0} cy={-4} r={7} fill={COLOR.bg} opacity={0.28} />
-    </G>
+    <Defs>
+      <RadialGradient
+        id="horizonGlow"
+        cx={HORIZON_X}
+        cy={HORIZON_Y}
+        fx={HORIZON_X}
+        fy={HORIZON_Y}
+        rx={220}
+        ry={168}
+        gradientUnits="userSpaceOnUse"
+      >
+        <Stop offset="0" stopColor={COLOR.horizonMist} stopOpacity={0.4} />
+        <Stop offset="0.42" stopColor={COLOR.horizonMist} stopOpacity={0.16} />
+        <Stop offset="1" stopColor={COLOR.horizonMist} stopOpacity={0} />
+      </RadialGradient>
+      <Filter
+        id="laneNeon"
+        x="-100%"
+        y="-100%"
+        width="300%"
+        height="300%"
+        filterUnits="objectBoundingBox"
+        primitiveUnits="userSpaceOnUse"
+      >
+        <FeGaussianBlur in="SourceGraphic" stdDeviation="3" result="blurTight" />
+        <FeFlood
+          floodColor={COLOR.railGlow}
+          floodOpacity={0.8}
+          result="tintTight"
+        />
+        <FeComposite
+          in="tintTight"
+          in2="blurTight"
+          operator="in"
+          result="glowTight"
+        />
+        <FeGaussianBlur in="SourceGraphic" stdDeviation="9" result="blurWide" />
+        <FeFlood
+          floodColor={COLOR.railGlow}
+          floodOpacity={0.3}
+          result="tintWide"
+        />
+        <FeComposite
+          in="tintWide"
+          in2="blurWide"
+          operator="in"
+          result="glowWide"
+        />
+        <FeMerge>
+          <FeMergeNode in="glowWide" />
+          <FeMergeNode in="glowTight" />
+          <FeMergeNode in="SourceGraphic" />
+        </FeMerge>
+      </Filter>
+    </Defs>
   );
 }
 
-function Atmosphere() {
+function RadarStage() {
   return (
     <G>
-      <Defs>
-        <LinearGradient id="atmosphere" x1="0%" y1="100%" x2="0%" y2="0%">
-          <Stop offset="0" stopColor={COLOR.bg} stopOpacity={0} />
-          <Stop offset="0.42" stopColor={COLOR.bg} stopOpacity={0.15} />
-          <Stop offset="1" stopColor={COLOR.atmosphere} stopOpacity={0.42} />
-        </LinearGradient>
-      </Defs>
       <Rect
         x={0}
         y={0}
         width={VIEW_W}
-        height={PATH_NEAR_Y}
-        fill="url(#atmosphere)"
+        height={VIEW_H}
+        fill={COLOR.radar}
       />
+      <Rect
+        x={0}
+        y={0}
+        width={VIEW_W}
+        height={PATH_NEAR_Y + 48}
+        fill="url(#horizonGlow)"
+      />
+      <Path d={roadSurfacePath()} fill={COLOR.road} opacity={0.92} />
     </G>
   );
 }
@@ -581,19 +657,17 @@ function PerspectiveGround() {
   const lines = [];
   for (let index = 0; index < PERSPECTIVE_LINES; index += 1) {
     const u = index / (PERSPECTIVE_LINES - 1);
-    const zNear = 1.12;
-    const zFar = 9;
-    const z = lerp(zNear, zFar, u);
-    const persp = (1 - 1 / z) / (1 - 1 / zFar);
-    const left = cubicPoint(pathAnchors('left'), persp);
-    const right = cubicPoint(pathAnchors('right'), persp);
-    const opacity = lerp(0.26, 0.04, persp);
+    const z = lerp(Z_NEAR, Z_FAR, u);
+    const t = (1 - Z_NEAR / z) / (1 - Z_NEAR / Z_FAR);
+    const left = projectWorld(-PATH_NEAR_HALF, z);
+    const right = projectWorld(PATH_NEAR_HALF, z);
+    const opacity = lerp(RUNG_OPACITY_NEAR, RUNG_OPACITY_FAR, t);
     lines.push(
       <Path
         key={`ground-${index}`}
         d={`M ${left.x} ${left.y} L ${right.x} ${right.y}`}
-        stroke={COLOR.cyan}
-        strokeWidth={1}
+        stroke={COLOR.rail}
+        strokeWidth={lerp(1.35, 0.4, t)}
         fill="none"
         opacity={opacity}
       />,
@@ -611,6 +685,8 @@ function FlankZone({
   level: FlankLevel;
   frame: number;
 }) {
+  const alerting = level !== 'safe';
+  const fade = useAlertFade(alerting);
   const live = flankPaint(level, frame);
   const gradientId = `flank-zone-${side}`;
   const labelX = side === 'left' ? 28 : 372;
@@ -620,6 +696,7 @@ function FlankZone({
     level === 'close' ? COLOR.red : level === 'caution' ? COLOR.orange : COLOR.muted;
   const innerX = side === 'left' ? '100%' : '0%';
   const outerX = side === 'left' ? '0%' : '100%';
+  const glowOpacity = lerp(0.08, Math.min(0.55, live.opacity * 0.5), fade);
 
   return (
     <G>
@@ -631,15 +708,20 @@ function FlankZone({
           x2={outerX}
           y2="0%"
         >
-          <Stop offset="0" stopColor={live.color} stopOpacity={Math.min(0.55, live.opacity * 0.5)} />
+          <Stop offset="0" stopColor={live.color} stopOpacity={glowOpacity} />
           <Stop offset="1" stopColor={live.color} stopOpacity={0} />
         </LinearGradient>
       </Defs>
-      <Path d={flankZonePath(side)} fill={`url(#${gradientId})`} />
+      <Path
+        d={flankZonePath(side)}
+        fill={`url(#${gradientId})`}
+        style={WEB_TINT_STYLE}
+      />
       <Path
         d={flankZonePath(side)}
         fill={live.color}
-        opacity={Math.min(0.22, live.opacity * 0.22)}
+        opacity={lerp(0.03, Math.min(0.22, live.opacity * 0.22), fade)}
+        style={WEB_TINT_STYLE}
       />
       <SvgText
         x={labelX}
@@ -656,44 +738,82 @@ function FlankZone({
   );
 }
 
+function LaneSheet({
+  side,
+  color,
+  active,
+  close,
+  frame,
+}: {
+  side: FlankSide;
+  color: string;
+  active: boolean;
+  close: boolean;
+  frame: number;
+}) {
+  const fade = useAlertFade(active);
+  const flash = close && flashOn(frame, 2) ? 1 : 0.42;
+  const opacity = fade * (close ? 0.34 * flash : 0.22);
+
+  return (
+    <Path
+      d={laneSheetPath(side)}
+      fill={color}
+      opacity={opacity}
+      style={WEB_TINT_STYLE}
+    />
+  );
+}
+
+function laneSheetState(
+  flank: FlankLevel,
+  incidents: readonly TelemetryIncident[],
+  side: FlankSide,
+): { color: string; active: boolean; close: boolean } {
+  if (flank === 'close') {
+    return { color: COLOR.red, active: true, close: true };
+  }
+  if (flank === 'caution') {
+    return { color: COLOR.orange, active: true, close: false };
+  }
+  for (const incident of incidents) {
+    const kind = incident.incident_type;
+    if (kind !== 'pedestrian_ahead' && kind !== 'pedestrian_critical') {
+      continue;
+    }
+    const lateral = clamp01(incident.lateral_position ?? 0.5);
+    if (side === 'left' && lateral >= 0.5) {
+      continue;
+    }
+    if (side === 'right' && lateral <= 0.5) {
+      continue;
+    }
+    if (kind === 'pedestrian_critical') {
+      return { color: COLOR.red, active: true, close: true };
+    }
+    return { color: COLOR.rail, active: true, close: false };
+  }
+  return { color: COLOR.rail, active: false, close: false };
+}
+
 function PathVector({
   level,
+  leftLevel,
+  rightLevel,
   frame,
 }: {
   level: CorridorLevel;
+  leftLevel: FlankLevel;
+  rightLevel: FlankLevel;
   frame: number;
 }) {
-  const live = corridorPaint(level, frame);
   const left = projectedLanePath('left');
   const right = projectedLanePath('right');
-  const strokeWidth = level === 'safe' ? 2.35 : 2.9;
-  const rails: FlankSide[] = ['left', 'right'];
 
   return (
     <G>
-      {rails.map((side) => {
-        const d = side === 'left' ? left : right;
-        return (
-          <G key={`rail-${side}`}>
-            <Path
-              d={d}
-              stroke={live.color}
-              strokeWidth={14}
-              strokeLinecap="round"
-              fill="none"
-              opacity={live.opacity * 0.14}
-            />
-            <Path
-              d={d}
-              stroke={live.color}
-              strokeWidth={strokeWidth}
-              strokeLinecap="round"
-              fill="none"
-              opacity={live.opacity}
-            />
-          </G>
-        );
-      })}
+      <CorridorRail d={left} level={leftLevel} frame={frame} />
+      <CorridorRail d={right} level={rightLevel} frame={frame} />
       <SvgText
         x={HORIZON_X}
         y={HORIZON_Y - 14}
@@ -715,6 +835,51 @@ function PathVector({
   );
 }
 
+function CorridorRail({
+  d,
+  level,
+  frame,
+}: {
+  d: string;
+  level: FlankLevel;
+  frame: number;
+}) {
+  const alerting = level !== 'safe';
+  const fade = useAlertFade(alerting);
+  const alertColor =
+    level === 'close' ? COLOR.red : level === 'caution' ? COLOR.orange : COLOR.rail;
+  const color = lerpHex(COLOR.rail, alertColor, fade);
+  const restOpacity = 0.88;
+  const flashPeriod = level === 'close' ? 2 : 4;
+  const alertOpacity = flashOn(frame, flashPeriod) ? 0.95 : 0.22;
+  const opacity = lerp(restOpacity, alertOpacity, fade);
+  const strokeWidth = lerp(2.4, 3.1, fade);
+
+  return (
+    <G>
+      <Path
+        d={d}
+        stroke={color}
+        strokeWidth={16}
+        strokeLinecap="round"
+        fill="none"
+        opacity={opacity * 0.18}
+        style={WEB_TINT_STYLE}
+      />
+      <Path
+        d={d}
+        stroke={color}
+        strokeWidth={strokeWidth}
+        strokeLinecap="round"
+        fill="none"
+        opacity={opacity}
+        filter="url(#laneNeon)"
+        style={WEB_TINT_STYLE}
+      />
+    </G>
+  );
+}
+
 function vehicleDepthT(gap: number): number {
   return clamp01(0.12 + (gap / 0.45) * 0.6);
 }
@@ -728,7 +893,7 @@ function VehicleMark({
 }) {
   const gap = incident.min_normalized_gap ?? LATERAL_PROXIMITY_THRESHOLD;
   const t = vehicleDepthT(gap);
-  const rail = cubicPoint(pathAnchors(side), t);
+  const rail = projectLane(side, t);
   const scale = lerp(1.12, 0.32, t);
   const width = 48 * scale;
   const height = 30 * scale;
@@ -754,6 +919,35 @@ function VehicleMark({
   );
 }
 
+function PedestrianGlyph({
+  color,
+  fillOpacity,
+  strokeOpacity,
+  strokeWidth,
+}: {
+  color: string;
+  fillOpacity: number;
+  strokeOpacity: number;
+  strokeWidth: number;
+}) {
+  const paint = {
+    fill: color,
+    fillOpacity,
+    stroke: color,
+    strokeOpacity,
+    strokeWidth,
+  };
+  return (
+    <G>
+      <Circle cx={0} cy={-21.5} r={4.15} {...paint} />
+      <Ellipse cx={0} cy={-13.2} rx={7.1} ry={4.35} {...paint} />
+      <Ellipse cx={0} cy={-5.4} rx={4.35} ry={6.4} {...paint} />
+      <Ellipse cx={-2.85} cy={-0.2} rx={1.7} ry={2.25} {...paint} />
+      <Ellipse cx={2.85} cy={-0.2} rx={1.7} ry={2.25} {...paint} />
+    </G>
+  );
+}
+
 function PedestrianMark({
   incident,
   frame,
@@ -761,22 +955,33 @@ function PedestrianMark({
   incident: TelemetryIncident;
   frame: number;
 }) {
+  const fade = useAlertFade(true, true);
   const proximity = clamp01(incident.max_proximity_index ?? 0.5);
   const t = 1 - proximity;
-  const point = cubicPoint(pathAnchors('left'), t);
-  const radius = 4.4 + proximity * 4.2;
-  const critical = incident.incident_type === 'pedestrian_critical';
-  const color = critical ? COLOR.red : COLOR.orange;
-  const opacity = critical ? (flashOn(frame, 2) ? 1 : 0.2) : 0.92;
+  const leftRail = projectLane('left', t);
+  const rightRail = projectLane('right', t);
+  const lateral = clamp01(incident.lateral_position ?? 0.5);
+  const x = lerp(leftRail.x, rightRail.x, lateral);
+  const y = lerp(leftRail.y, rightRail.y, lateral);
+  const scale = lerp(1.18, 0.22, t);
+  const status = incidentStatus(incident);
+  const color = lerpHex(COLOR.muted, alertTint(status), fade);
+  const flashPeriod = status === 'critical' ? 2 : 4;
+  const flash = flashOn(frame, flashPeriod) ? 1 : 0.22;
+  const strokeOpacity = lerp(0.2, flash, fade);
+  const fillOpacity = lerp(0.04, 0.2 * flash, fade);
 
   return (
-    <Circle
-      cx={HORIZON_X}
-      cy={point.y}
-      r={radius}
-      fill={color}
-      opacity={opacity}
-    />
+    <G x={x} y={y}>
+      <G scale={scale}>
+        <PedestrianGlyph
+          color={color}
+          fillOpacity={fillOpacity}
+          strokeOpacity={strokeOpacity}
+          strokeWidth={1.15}
+        />
+      </G>
+    </G>
   );
 }
 
@@ -829,6 +1034,8 @@ function CockpitCanvas({
   const left = flankLevel(threats.leftCaution, threats.leftClose);
   const right = flankLevel(threats.rightCaution, threats.rightClose);
   const corridor = corridorLevel(threats);
+  const leftSheet = laneSheetState(left, incidents, 'left');
+  const rightSheet = laneSheetState(right, incidents, 'right');
 
   return (
     <Svg
@@ -836,23 +1043,144 @@ function CockpitCanvas({
       height={size.height}
       viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
       preserveAspectRatio="xMidYMid meet"
+      style={{ backgroundColor: COLOR.radar }}
     >
-      <Atmosphere />
+      <RadarDefs />
+      <RadarStage />
       <PerspectiveGround />
+      <LaneSheet
+        side="left"
+        color={leftSheet.color}
+        active={leftSheet.active}
+        close={leftSheet.close}
+        frame={frame}
+      />
+      <LaneSheet
+        side="right"
+        color={rightSheet.color}
+        active={rightSheet.active}
+        close={rightSheet.close}
+        frame={frame}
+      />
       <FlankZone side="left" level={left} frame={frame} />
       <FlankZone side="right" level={right} frame={frame} />
-      <PathVector level={corridor} frame={frame} />
+      <PathVector
+        level={corridor}
+        leftLevel={left}
+        rightLevel={right}
+        frame={frame}
+      />
       <IncidentActors incidents={incidents} frame={frame} />
-      <G x={BIKE_X} y={BIKE_Y}>
-        <BicycleGlyph />
-      </G>
     </Svg>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Video clock — HTML5 on web, expo-video on native
-// ---------------------------------------------------------------------------
+function meetBox(size: CanvasSize): { scale: number; ox: number; oy: number } {
+  const scale = Math.min(size.width / VIEW_W, size.height / VIEW_H);
+  return {
+    scale,
+    ox: (size.width - VIEW_W * scale) / 2,
+    oy: (size.height - VIEW_H * scale) / 2,
+  };
+}
+
+function glowTint(status: FrameStatus): string {
+  if (status === 'critical') {
+    return COLOR.red;
+  }
+  if (status === 'risk') {
+    return COLOR.orange;
+  }
+  return COLOR.rail;
+}
+
+function CyclistMarker({
+  size,
+  status,
+}: {
+  size: CanvasSize;
+  status: FrameStatus;
+}) {
+  const fade = useAlertFade(status !== 'clear');
+  const colorRef = useRef(COLOR.rail);
+  if (status !== 'clear') {
+    colorRef.current = glowTint(status);
+  }
+  const color = colorRef.current;
+  const { scale, ox, oy } = meetBox(size);
+  const icon = ICON_VIEW * scale;
+  const glow = GLOW_VIEW * scale;
+  const iconUri = resolveAssetUri(CYCLIST_ICON, Platform.OS, {
+    fromModule: (moduleId) => Asset.fromModule(moduleId),
+    resolveAssetSource: Image.resolveAssetSource,
+  });
+
+  return (
+    <View
+      pointerEvents="none"
+      style={[
+        styles.cyclistMarker,
+        {
+          left: ox + BIKE_X * scale - glow / 2,
+          top: oy + BIKE_Y * scale - glow / 2,
+          width: glow,
+          height: glow,
+        },
+      ]}
+    >
+      <View
+        style={[
+          styles.cyclistGlow,
+          {
+            width: glow,
+            height: glow,
+            borderRadius: glow / 2,
+            opacity: fade * 0.58,
+            ...(Platform.OS === 'web'
+              ? {
+                  backgroundColor: 'transparent',
+                  // @ts-expect-error web css
+                  backgroundImage: `radial-gradient(circle, ${color} 0%, ${color} 30%, transparent 72%)`,
+                  filter: 'blur(18px)',
+                  transition: `opacity ${ALERT_FADE_MS}ms ease`,
+                }
+              : {
+                  backgroundColor: color,
+                  shadowColor: color,
+                  shadowOffset: { width: 0, height: 0 },
+                  shadowOpacity: 0.9,
+                  shadowRadius: 28,
+                }),
+          },
+        ]}
+      />
+      {Platform.OS === 'web'
+        ? createElement('img', {
+            src: iconUri,
+            alt: '',
+            draggable: false,
+            style: {
+              width: icon,
+              height: icon,
+              objectFit: 'contain',
+              position: 'relative',
+              zIndex: 1,
+              pointerEvents: 'none',
+              display: 'block',
+            },
+          })
+        : (
+          <Image
+            source={CYCLIST_ICON}
+            resizeMode="contain"
+            style={{ width: icon, height: icon, zIndex: 1 }}
+          />
+        )}
+    </View>
+  );
+}
+
+// --- video ---
 
 function WebRideVideo({
   uri,
@@ -925,6 +1253,10 @@ function WebRideVideo({
         node.currentTime = 0;
         onTimeRef.current(0);
         onPlayingRef.current(false);
+      },
+      seek: (seconds: number) => {
+        node.currentTime = seconds;
+        onTimeRef.current(node.currentTime);
       },
     };
 
@@ -1016,6 +1348,10 @@ function NativeRideVideo({
         onTimeRef.current(0);
         onPlayingRef.current(false);
       },
+      seek: (seconds: number) => {
+        player.currentTime = seconds;
+        onTimeRef.current(seconds);
+      },
     };
 
     player.play();
@@ -1065,42 +1401,12 @@ const RideFeed = memo(function RideFeed({
   );
 });
 
-// ---------------------------------------------------------------------------
-// Chrome: header + transport
-// ---------------------------------------------------------------------------
-
-function ScoreMeter({ score }: { score: number }) {
-  const pct = Math.max(0, Math.min(100, score));
-  const hue = scoreHue(score);
-
-  return (
-    <View
-      accessibilityRole="progressbar"
-      accessibilityLabel={`Safety score ${Math.round(score)}`}
-      style={styles.scoreMeter}
-    >
-      <Text style={styles.scoreMeterLabel}>SCORE</Text>
-      <View style={styles.scoreTrack}>
-        <View
-          style={[
-            styles.scoreFill,
-            { width: `${pct}%`, backgroundColor: hue },
-          ]}
-        />
-      </View>
-      <Text style={[styles.scoreMeterValue, { color: hue }]}>
-        {Math.round(score)}
-      </Text>
-    </View>
-  );
-}
+// --- chrome ---
 
 function HeaderPanel({
-  score,
   frame,
   playing,
 }: {
-  score: number;
   frame: number;
   playing: boolean;
 }) {
@@ -1111,7 +1417,6 @@ function HeaderPanel({
       <View style={styles.headerTop}>
         <Text style={styles.brand}>ARAS</Text>
         <Text style={styles.brandSub}>URBAN CYCLIST</Text>
-        <ScoreMeter score={score} />
         <View style={styles.livePill}>
           <View
             style={[
@@ -1143,17 +1448,21 @@ function ControlIsland({
   atEnd,
   atStart,
   frame,
+  reportOpen,
   onPlay,
   onPause,
   onReset,
+  onToggleReport,
 }: {
   playing: boolean;
   atEnd: boolean;
   atStart: boolean;
   frame: number;
+  reportOpen: boolean;
   onPlay: () => void;
   onPause: () => void;
   onReset: () => void;
+  onToggleReport: () => void;
 }) {
   return (
     <View style={styles.controls}>
@@ -1180,6 +1489,25 @@ function ControlIsland({
           onPress={onReset}
         />
       </View>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={reportOpen ? 'Back to ride' : 'View Ride Report'}
+        onPress={onToggleReport}
+        hitSlop={8}
+        style={({ pressed }) => [
+          styles.reportToggle,
+          pressed ? styles.reportTogglePressed : null,
+        ]}
+      >
+        <Text
+          style={[
+            styles.reportToggleLabel,
+            reportOpen ? styles.transportActive : null,
+          ]}
+        >
+          {reportOpen ? 'BACK TO RIDE' : 'VIEW RIDE REPORT'}
+        </Text>
+      </Pressable>
       <Text style={styles.frameReadout}>
         FRAME {padFrame(frame)} / {padFrame(LAST_FRAME)}
       </Text>
@@ -1235,18 +1563,133 @@ function TransportButton({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Root simulator
-// ---------------------------------------------------------------------------
+function RideReport({
+  onSeekEvent,
+}: {
+  onSeekEvent: (seconds: number) => void;
+}) {
+  const counts = SUMMARY.tier_counts ?? {
+    awareness: 0,
+    risk: 0,
+    critical: 0,
+  };
+  const events = SUMMARY.risk_critical_events ?? [];
+  const rate = SUMMARY.risk_critical_per_minute ?? 0;
+
+  return (
+    <View style={styles.report}>
+      <Text style={styles.reportKicker}>RIDE REPORT</Text>
+
+      <View style={styles.reportTiers}>
+        <TierStat
+          label="AWARENESS"
+          value={counts.awareness}
+          color={COLOR.orange}
+        />
+        <TierStat
+          label="RISK"
+          value={counts.risk}
+          color={COLOR.orangeRed}
+        />
+        <TierStat
+          label="CRITICAL"
+          value={counts.critical}
+          color={COLOR.red}
+        />
+      </View>
+
+      <View style={styles.reportRate}>
+        <Text style={styles.progressTitle}>HAZARD EFFICIENCY RATE</Text>
+        <View style={styles.reportRateScore}>
+          <Text style={styles.reportRateValue}>{rate.toFixed(2)}</Text>
+          <Text style={styles.reportRateNote}>
+            (risk + critical events detected per minute of total ride time)
+          </Text>
+        </View>
+      </View>
+
+      <Text style={[styles.progressTitle, styles.reportListLabel]}>
+        RISK & CRITICAL EVENTS
+      </Text>
+      <ScrollView
+        style={styles.reportList}
+        contentContainerStyle={styles.reportListContent}
+      >
+        {events.length === 0 ? (
+          <Text style={styles.reportEmpty}>NO RISK OR CRITICAL EVENTS</Text>
+        ) : (
+          events.map((event, index) => {
+            const tone =
+              event.tier === 'critical' ? COLOR.red : COLOR.orangeRed;
+            return (
+              <Pressable
+                key={`${event.start_frame}-${event.incident_type}-${index}`}
+                accessibilityRole="button"
+                accessibilityLabel={`Jump to ${event.incident_type} at ${formatSeconds(event.timestamp_seconds)}`}
+                onPress={() => onSeekEvent(event.timestamp_seconds)}
+                style={({ pressed }) => [
+                  styles.reportRow,
+                  pressed ? styles.reportRowPressed : null,
+                ]}
+              >
+                <View style={[styles.alertMark, { backgroundColor: tone }]} />
+                <Text style={[styles.reportTier, { color: tone }]}>
+                  {String(event.tier).toUpperCase()}
+                </Text>
+                <Text style={styles.reportEventType} numberOfLines={1}>
+                  {formatIncidentType(String(event.incident_type))}
+                </Text>
+                <Text style={styles.reportEventTime}>
+                  {formatSeconds(event.timestamp_seconds)}
+                </Text>
+              </Pressable>
+            );
+          })
+        )}
+      </ScrollView>
+    </View>
+  );
+}
+
+function TierStat({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: number;
+  color: string;
+}) {
+  const empty = value === 0;
+
+  return (
+    <View style={[styles.tierStat, empty ? styles.tierStatEmpty : null]}>
+      <Text
+        style={[
+          styles.tierStatValue,
+          { color },
+          empty ? styles.tierStatValueEmpty : null,
+        ]}
+      >
+        {empty ? '0 (None Detected)' : value}
+      </Text>
+      <Text style={styles.tierStatLabel}>{label}</Text>
+    </View>
+  );
+}
+
+// --- app ---
 
 export default function App() {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
   const [canvasSize, setCanvasSize] = useState<CanvasSize>({
     width: VIEW_W,
     height: 420,
   });
   const controllerRef = useRef<PlaybackController | null>(null);
+  const wasAtEndRef = useRef(false);
 
   const onTimeSeconds = useCallback((seconds: number) => {
     const next = frameFromVideoTime(seconds);
@@ -1265,8 +1708,21 @@ export default function App() {
     () => extractActiveIncidents(INCIDENTS, currentFrame),
     [currentFrame],
   );
-  const liveScore = useMemo(() => safetyScoreAt(currentFrame), [currentFrame]);
-  const alert = useMemo(() => primaryAlert(threats), [threats]);
+  const liveStatus = TELEMETRY.frame_status[currentFrame] ?? 'clear';
+  const statusView = STATUS_COPY[liveStatus] ?? STATUS_COPY.clear;
+  const statusSubtitle = useMemo(
+    () => activeIncidentTypeLabel(INCIDENTS, currentFrame, liveStatus),
+    [currentFrame, liveStatus],
+  );
+
+  const atEnd = currentFrame >= LAST_FRAME;
+
+  useEffect(() => {
+    if (atEnd && !wasAtEndRef.current) {
+      setReportOpen(true);
+    }
+    wasAtEndRef.current = atEnd;
+  }, [atEnd]);
 
   const onPlay = useCallback(() => {
     if (currentFrame >= LAST_FRAME) {
@@ -1283,6 +1739,21 @@ export default function App() {
     controllerRef.current?.reset();
     setCurrentFrame(0);
     setIsPlaying(false);
+    setReportOpen(false);
+  }, []);
+
+  const onToggleReport = useCallback(() => {
+    if (!reportOpen) {
+      controllerRef.current?.pause();
+      setIsPlaying(false);
+    }
+    setReportOpen((open) => !open);
+  }, [reportOpen]);
+
+  const onSeekEvent = useCallback((seconds: number) => {
+    controllerRef.current?.seek(seconds);
+    controllerRef.current?.pause();
+    setIsPlaying(false);
   }, []);
 
   const onCanvasLayout = useCallback((event: LayoutChangeEvent) => {
@@ -1293,17 +1764,10 @@ export default function App() {
     setCanvasSize({ width, height });
   }, []);
 
-  const alertColor =
-    alert.tone === 'critical'
-      ? COLOR.red
-      : alert.tone === 'caution'
-        ? COLOR.orange
-        : COLOR.cyan;
-
   return (
     <View style={styles.root}>
       <StatusBar style="light" />
-      <HeaderPanel score={liveScore} frame={currentFrame} playing={isPlaying} />
+      <HeaderPanel frame={currentFrame} playing={isPlaying} />
 
       <View style={styles.stage}>
         <View style={styles.videoColumn}>
@@ -1320,31 +1784,52 @@ export default function App() {
         <View style={styles.columnRule} />
 
         <View style={styles.radarColumn}>
-          <View style={styles.canvasWrap} onLayout={onCanvasLayout}>
-            <CockpitCanvas
-              threats={threats}
-              incidents={activeIncidents}
-              frame={currentFrame}
-              size={canvasSize}
-            />
-          </View>
-          <View style={styles.alertBanner}>
-            <View style={[styles.alertMark, { backgroundColor: alertColor }]} />
-            <Text style={[styles.alertTitle, { color: alertColor }]}>
-              {alert.title}
-            </Text>
-          </View>
+          {reportOpen ? (
+            <RideReport onSeekEvent={onSeekEvent} />
+          ) : (
+            <>
+              <View style={styles.canvasWrap} onLayout={onCanvasLayout}>
+                <CockpitCanvas
+                  threats={threats}
+                  incidents={activeIncidents}
+                  frame={currentFrame}
+                  size={canvasSize}
+                />
+                <CyclistMarker size={canvasSize} status={liveStatus} />
+              </View>
+              <View style={styles.alertBanner}>
+                <View style={styles.alertHeadline}>
+                  <View
+                    style={[
+                      styles.alertMark,
+                      { backgroundColor: statusView.color },
+                    ]}
+                  />
+                  <Text style={[styles.alertTitle, { color: statusView.color }]}>
+                    {statusView.label}
+                  </Text>
+                </View>
+                <View style={styles.alertSubtitleSlot}>
+                  {statusSubtitle ? (
+                    <Text style={styles.alertSubtitle}>{statusSubtitle}</Text>
+                  ) : null}
+                </View>
+              </View>
+            </>
+          )}
         </View>
       </View>
 
       <ControlIsland
         playing={isPlaying}
-        atEnd={currentFrame >= LAST_FRAME}
+        atEnd={atEnd}
         atStart={currentFrame === 0}
         frame={currentFrame}
+        reportOpen={reportOpen}
         onPlay={onPlay}
         onPause={onPause}
         onReset={onReset}
+        onToggleReport={onToggleReport}
       />
     </View>
   );
@@ -1393,38 +1878,6 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '700',
     letterSpacing: 2,
-  },
-  scoreMeter: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginRight: 6,
-  },
-  scoreMeterLabel: {
-    color: COLOR.muted,
-    fontSize: 9,
-    fontWeight: '700',
-    letterSpacing: 1.8,
-  },
-  scoreTrack: {
-    width: 88,
-    height: 5,
-    borderRadius: 3,
-    backgroundColor: COLOR.cyanDeep,
-    overflow: 'hidden',
-  },
-  scoreFill: {
-    height: 5,
-    borderRadius: 3,
-  },
-  scoreMeterValue: {
-    width: 22,
-    color: COLOR.text,
-    fontSize: 11,
-    fontWeight: '600',
-    fontVariant: ['tabular-nums'],
-    letterSpacing: 0.4,
-    textAlign: 'right',
   },
   progressBlock: {
     marginTop: 14,
@@ -1509,14 +1962,30 @@ const styles = StyleSheet.create({
   canvasWrap: {
     flex: 1,
     minHeight: 220,
+    backgroundColor: COLOR.radar,
+    borderRadius: 14,
+    overflow: 'hidden',
+  },
+  cyclistMarker: {
+    position: 'absolute',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cyclistGlow: {
+    position: 'absolute',
   },
   alertBanner: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  alertHeadline: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
   },
   alertMark: {
     width: 6,
@@ -1528,6 +1997,19 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     letterSpacing: 2.4,
     textAlign: 'center',
+  },
+  alertSubtitleSlot: {
+    minHeight: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  alertSubtitle: {
+    color: COLOR.muted,
+    fontSize: 10,
+    fontWeight: '500',
+    letterSpacing: 0.6,
+    textAlign: 'center',
+    textTransform: 'lowercase',
   },
   controls: {
     paddingHorizontal: 20,
@@ -1570,12 +2052,151 @@ const styles = StyleSheet.create({
   transportDisabled: {
     color: '#3A4046',
   },
+  reportToggle: {
+    alignItems: 'center',
+    paddingVertical: 10,
+    marginTop: 8,
+  },
+  reportTogglePressed: {
+    opacity: 0.7,
+  },
+  reportToggleLabel: {
+    color: COLOR.muted,
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 2.2,
+  },
+  report: {
+    flex: 1,
+    minHeight: 220,
+    paddingHorizontal: 8,
+    paddingTop: 8,
+    paddingBottom: 4,
+  },
+  reportKicker: {
+    color: COLOR.text,
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 4,
+    marginBottom: 16,
+  },
+  reportTiers: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 16,
+  },
+  tierStat: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 6,
+    borderWidth: 1,
+    borderColor: COLOR.hairline,
+    borderRadius: 14,
+    backgroundColor: COLOR.island,
+    gap: 4,
+  },
+  tierStatEmpty: {
+    opacity: 0.42,
+  },
+  tierStatValue: {
+    fontSize: 22,
+    fontWeight: '600',
+    fontVariant: ['tabular-nums'],
+    letterSpacing: 0.4,
+    textAlign: 'center',
+  },
+  tierStatValueEmpty: {
+    fontSize: 11,
+    letterSpacing: 0.2,
+  },
+  tierStatLabel: {
+    color: COLOR.muted,
+    fontSize: 9,
+    fontWeight: '700',
+    letterSpacing: 1.8,
+  },
+  reportRate: {
+    marginBottom: 16,
+    paddingBottom: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: COLOR.hairline,
+    gap: 6,
+  },
+  reportRateScore: {
+    gap: 4,
+  },
+  reportRateValue: {
+    color: COLOR.text,
+    fontSize: 18,
+    fontWeight: '600',
+    fontVariant: ['tabular-nums'],
+    letterSpacing: 0.6,
+  },
+  reportRateNote: {
+    color: COLOR.muted,
+    fontSize: 9,
+    fontWeight: '500',
+    letterSpacing: 0.3,
+    lineHeight: 13,
+  },
+  reportListLabel: {
+    marginBottom: 8,
+  },
+  reportList: {
+    flex: 1,
+    minHeight: 0,
+  },
+  reportListContent: {
+    paddingBottom: 8,
+    gap: 4,
+  },
+  reportEmpty: {
+    color: COLOR.muted,
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 2,
+    paddingVertical: 16,
+  },
+  reportRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLOR.hairline,
+    backgroundColor: COLOR.island,
+  },
+  reportRowPressed: {
+    backgroundColor: '#11151A',
+  },
+  reportTier: {
+    fontSize: 9,
+    fontWeight: '700',
+    letterSpacing: 1.6,
+    width: 72,
+  },
+  reportEventType: {
+    flex: 1,
+    color: COLOR.text,
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 1.4,
+  },
+  reportEventTime: {
+    color: COLOR.muted,
+    fontSize: 11,
+    fontVariant: ['tabular-nums'],
+    letterSpacing: 0.6,
+  },
   frameReadout: {
     color: COLOR.muted,
     fontSize: 10,
     letterSpacing: 2,
     textAlign: 'center',
-    marginTop: 10,
+    marginTop: 4,
     fontVariant: ['tabular-nums'],
   },
 });

@@ -43,6 +43,20 @@ def _ground_contact_point(box: tuple[int, int, int, int]) -> tuple[float, float]
     return ((x1 + x2) / 2.0, float(y2))
 
 
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _forward_lane_bounds(
+    frame_width: int,
+    lane_width_fraction: float,
+) -> tuple[float, float]:
+    """Centered corridor edges used by in-lane tests and lateral_position."""
+    half_lane = (frame_width * lane_width_fraction) / 2.0
+    lane_center = frame_width / 2.0
+    return lane_center - half_lane, lane_center + half_lane
+
+
 def _is_in_forward_lane(
     ground_x: float,
     ground_y: float,
@@ -56,16 +70,32 @@ def _is_in_forward_lane(
     if ground_y < horizon_y:
         return False
 
-    half_lane = (frame_width * lane_width_fraction) / 2.0
-    lane_center = frame_width / 2.0
-    return (lane_center - half_lane) <= ground_x <= (lane_center + half_lane)
+    lane_left_x, lane_right_x = _forward_lane_bounds(
+        frame_width, lane_width_fraction
+    )
+    return lane_left_x <= ground_x <= lane_right_x
+
+
+def _lateral_position(
+    ground_x: float,
+    frame_width: int,
+    lane_width_fraction: float,
+) -> float:
+    """0.0 left corridor edge, 0.5 center, 1.0 right corridor edge."""
+    lane_left_x, lane_right_x = _forward_lane_bounds(
+        frame_width, lane_width_fraction
+    )
+    span = lane_right_x - lane_left_x
+    if span <= 0:
+        return 0.5
+    return _clamp01((ground_x - lane_left_x) / span)
 
 
 def _proximity_index(ground_y: float, frame_height: int) -> float:
     """How close: 0 at the top of the frame, 1 at the bottom."""
     if frame_height <= 0:
         return 0.0
-    return max(0.0, min(1.0, ground_y / float(frame_height)))
+    return _clamp01(ground_y / float(frame_height))
 
 
 def _log_event(action: str, incident_type: str, track_id: int, frame: int, **details: Any) -> None:
@@ -79,6 +109,7 @@ def _start_event(
     track_id: int,
     frame_idx: int,
     proximity_index: float,
+    lateral_position: float,
 ) -> dict[str, Any]:
     _log_event(
         "START",
@@ -86,6 +117,7 @@ def _start_event(
         track_id,
         frame_idx,
         proximity_index=f"{proximity_index:.3f}",
+        lateral_position=f"{lateral_position:.3f}",
     )
     return {
         "track_id": track_id,
@@ -94,6 +126,7 @@ def _start_event(
         "end_frame": frame_idx,
         "max_severity_score": 0.0,
         "max_proximity_index": proximity_index,
+        "lateral_position": lateral_position,
     }
 
 
@@ -103,9 +136,12 @@ def _update_event(
     proximity_index: float,
     severity_score: float,
     incident_type: str,
+    lateral_position: float,
 ) -> None:
     """Update the open event. Escalates ahead -> critical, never the reverse."""
     event["end_frame"] = frame_idx
+    if proximity_index >= event["max_proximity_index"]:
+        event["lateral_position"] = lateral_position
     event["max_proximity_index"] = max(event["max_proximity_index"], proximity_index)
     event["max_severity_score"] = max(event["max_severity_score"], severity_score)
     if (
@@ -131,6 +167,7 @@ def _finalize_event(event: dict[str, Any]) -> dict[str, Any]:
         start_frame=event["start_frame"],
         max_severity=f"{event['max_severity_score']:.3f}",
         max_proximity_index=f"{event['max_proximity_index']:.3f}",
+        lateral_position=f"{event['lateral_position']:.3f}",
     )
     return {
         "track_id": event["track_id"],
@@ -139,6 +176,7 @@ def _finalize_event(event: dict[str, Any]) -> dict[str, Any]:
         "end_frame": event["end_frame"],
         "max_severity_score": event["max_severity_score"],
         "max_proximity_index": event["max_proximity_index"],
+        "lateral_position": event["lateral_position"],
     }
 
 
@@ -219,6 +257,9 @@ def analyze_pedestrian_safety(
             state.consecutive_out_of_lane_frames = 0
             state.ground_history.append((ground_x, ground_y))
             proximity = _proximity_index(ground_y, frame_height)
+            lateral_position = _lateral_position(
+                ground_x, frame_width, lane_width_fraction
+            )
             incident_type = (
                 "pedestrian_critical"
                 if proximity > critical_proximity_threshold
@@ -241,6 +282,7 @@ def analyze_pedestrian_safety(
                     track_id,
                     frame_idx,
                     proximity,
+                    lateral_position,
                 )
             _update_event(
                 state.active_event,
@@ -248,6 +290,7 @@ def analyze_pedestrian_safety(
                 proximity,
                 severity_score,
                 incident_type,
+                lateral_position,
             )
 
         # tracks missing this frame

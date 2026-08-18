@@ -40,3 +40,4 @@ yarn-error.*
 /ios
 /android
 cyclist-aras/public/ride1_detected.mp4
+.vercel
